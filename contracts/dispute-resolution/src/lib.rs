@@ -2,12 +2,49 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short,
-    Address, Env, String, Symbol, token,
+    Address, Env, String, Symbol,
 };
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
+const ESCROW_CONTRACT: Symbol = symbol_short!("ESCROW");
+
+// ── Client interfaces ────────────────────────────────────────────────────────
+
+#[soroban_sdk::contracttype]
+#[derive(Clone, PartialEq)]
+pub enum RideStatus {
+    Pending,
+    Funded,
+    Completed,
+    Refunded,
+    Disputed,
+}
+
+#[soroban_sdk::contracttype]
+#[derive(Clone)]
+pub struct RideEscrow {
+    pub ride_id:   Symbol,
+    pub passenger: Address,
+    pub driver:    Address,
+    pub token:     Address,
+    pub amount:    i128,
+    pub status:    RideStatus,
+}
+
+#[soroban_sdk::contractclient(name = "RideEscrowClient")]
+pub trait RideEscrowContract {
+    fn get_escrow(env: Env, ride_id: Symbol) -> RideEscrow;
+    fn resolve_dispute(
+        env: Env,
+        caller: Address,
+        ride_id: Symbol,
+        passenger_amount: i128,
+        driver_amount: i128,
+    );
+    fn dismiss_dispute(env: Env, caller: Address, ride_id: Symbol);
+}
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -60,11 +97,12 @@ pub struct DisputeResolutionContract;
 impl DisputeResolutionContract {
 
     /// One-time initialisation.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address, escrow_contract: Address) {
         if env.storage().instance().has(&ADMIN) {
             panic!("already initialized");
         }
         env.storage().instance().set(&ADMIN, &admin);
+        env.storage().instance().set(&ESCROW_CONTRACT, &escrow_contract);
     }
 
     /// Either the passenger or driver raises a dispute.
@@ -75,34 +113,35 @@ impl DisputeResolutionContract {
         dispute_id:      Symbol,
         ride_id:         Symbol,
         raised_by:       Address,
-        passenger:       Address,
-        driver:          Address,
-        token:           Address,
-        escrowed_amount: i128,
         reason:          DisputeReason,
         description:     String,
     ) {
         raised_by.require_auth();
 
-        if raised_by != passenger && raised_by != driver {
-            panic!("only ride participants can raise a dispute");
-        }
-
         if env.storage().persistent().has(&dispute_id) {
             panic!("dispute already exists");
         }
 
-        if escrowed_amount <= 0 {
-            panic!("escrowed amount must be positive");
+        // Fetch escrow details from RideEscrowContract
+        let escrow_contract: Address = env.storage().instance().get(&ESCROW_CONTRACT).expect("not initialized");
+        let escrow_client = RideEscrowClient::new(&env, &escrow_contract);
+        let escrow = escrow_client.get_escrow(&ride_id);
+
+        if raised_by != escrow.passenger && raised_by != escrow.driver {
+            panic!("only ride participants can raise a dispute");
+        }
+
+        if escrow.status != RideStatus::Disputed {
+            panic!("associated escrow is not in disputed state");
         }
 
         let dispute = Dispute {
             dispute_id:       dispute_id.clone(),
             ride_id,
-            passenger,
-            driver,
-            token,
-            escrowed_amount,
+            passenger:        escrow.passenger,
+            driver:           escrow.driver,
+            token:            escrow.token,
+            escrowed_amount:  escrow.amount,
             reason,
             description,
             status:           DisputeStatus::Open,
@@ -117,7 +156,7 @@ impl DisputeResolutionContract {
 
         env.events().publish(
             (symbol_short!("raised"), dispute_id),
-            escrowed_amount,
+            escrow.amount,
         );
     }
 
@@ -155,25 +194,15 @@ impl DisputeResolutionContract {
             panic!("amounts cannot be negative");
         }
 
-        let token_client = token::Client::new(&env, &dispute.token);
-
-        // Pay passenger their share
-        if passenger_amount > 0 {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &dispute.passenger,
-                &passenger_amount,
-            );
-        }
-
-        // Pay driver their share
-        if driver_amount > 0 {
-            token_client.transfer(
-                &env.current_contract_address(),
-                &dispute.driver,
-                &driver_amount,
-            );
-        }
+        // Call resolve_dispute on the RideEscrowContract
+        let escrow_contract: Address = env.storage().instance().get(&ESCROW_CONTRACT).expect("not initialized");
+        let escrow_client = RideEscrowClient::new(&env, &escrow_contract);
+        escrow_client.resolve_dispute(
+            &env.current_contract_address(),
+            &dispute.ride_id,
+            &passenger_amount,
+            &driver_amount,
+        );
 
         // Determine resolution type
         dispute.status = if driver_amount == 0 {
@@ -216,6 +245,11 @@ impl DisputeResolutionContract {
             panic!("dispute is not open");
         }
 
+        // Revert escrow status back to Funded
+        let escrow_contract: Address = env.storage().instance().get(&ESCROW_CONTRACT).expect("not initialized");
+        let escrow_client = RideEscrowClient::new(&env, &escrow_contract);
+        escrow_client.dismiss_dispute(&env.current_contract_address(), &dispute.ride_id);
+
         dispute.status      = DisputeStatus::Dismissed;
         dispute.resolved_at = env.ledger().timestamp();
 
@@ -239,4 +273,12 @@ impl DisputeResolutionContract {
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&ADMIN).expect("not initialized")
     }
+
+    /// Returns the escrow contract address.
+    pub fn get_escrow_contract(env: Env) -> Address {
+        env.storage().instance().get(&ESCROW_CONTRACT).expect("not initialized")
+    }
 }
+
+#[cfg(test)]
+mod test;

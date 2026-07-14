@@ -8,6 +8,7 @@ use soroban_sdk::{
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
+const ESCROW_CONTRACT: Symbol = symbol_short!("ESCROW");
 
 // ── Data types ────────────────────────────────────────────────────────────────
 
@@ -39,11 +40,12 @@ pub struct DriverPayoutContract;
 impl DriverPayoutContract {
 
     /// One-time initialisation.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address, escrow_contract: Address) {
         if env.storage().instance().has(&ADMIN) {
             panic!("already initialized");
         }
         env.storage().instance().set(&ADMIN, &admin);
+        env.storage().instance().set(&ESCROW_CONTRACT, &escrow_contract);
     }
 
     /// Called by the escrow contract (or admin) after a ride completes.
@@ -59,8 +61,15 @@ impl DriverPayoutContract {
         caller.require_auth();
 
         let admin: Address = env.storage().instance().get(&ADMIN).expect("not initialized");
-        if caller != admin {
-            panic!("only admin can record payouts");
+        let escrow_contract: Address = env.storage().instance().get(&ESCROW_CONTRACT).expect("not initialized");
+        
+        if caller != admin && caller != escrow_contract {
+            panic!("only admin or escrow contract can record payouts");
+        }
+
+        if caller == admin {
+            let token_client = token::Client::new(&env, &token);
+            token_client.transfer(&admin, &env.current_contract_address(), &amount);
         }
 
         if amount <= 0 {
@@ -143,9 +152,10 @@ impl DriverPayoutContract {
             panic!("amount must be positive");
         }
 
+        // Transfer from admin to driver
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(
-            &env.current_contract_address(),
+            &admin,
             &driver,
             &amount,
         );
@@ -175,6 +185,11 @@ impl DriverPayoutContract {
             .expect("payout record not found")
     }
 
+    /// Returns the escrow contract address.
+    pub fn get_escrow_contract(env: Env) -> Address {
+        env.storage().instance().get(&ESCROW_CONTRACT).expect("not initialized")
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn _get_or_create_earnings(env: &Env, driver: &Address) -> DriverEarnings {
@@ -189,3 +204,6 @@ impl DriverPayoutContract {
             })
     }
 }
+
+#[cfg(test)]
+mod test;

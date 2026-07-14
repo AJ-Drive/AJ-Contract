@@ -8,6 +8,22 @@ use soroban_sdk::{
 // ── Storage keys ────────────────────────────────────────────────────────────
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
+const PAYOUT_CONTRACT: Symbol = symbol_short!("PAYOUT");
+const DISPUTE_CONTRACT: Symbol = symbol_short!("DISPUTE");
+
+// ── Client interfaces ────────────────────────────────────────────────────────
+
+#[soroban_sdk::contractclient(name = "DriverPayoutClient")]
+pub trait DriverPayout {
+    fn record_payout(
+        env: Env,
+        caller: Address,
+        driver: Address,
+        token: Address,
+        amount: i128,
+        ride_id: Symbol,
+    );
+}
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -40,12 +56,19 @@ pub struct RideEscrowContract;
 #[contractimpl]
 impl RideEscrowContract {
 
-    /// One-time initialisation — sets the platform admin address.
-    pub fn initialize(env: Env, admin: Address) {
+    /// One-time initialisation — sets the platform admin address and linked contracts.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        payout_contract: Address,
+        dispute_contract: Address,
+    ) {
         if env.storage().instance().has(&ADMIN) {
             panic!("already initialized");
         }
         env.storage().instance().set(&ADMIN, &admin);
+        env.storage().instance().set(&PAYOUT_CONTRACT, &payout_contract);
+        env.storage().instance().set(&DISPUTE_CONTRACT, &dispute_contract);
     }
 
     /// Passenger deposits funds into escrow when a ride is booked.
@@ -112,12 +135,24 @@ impl RideEscrowContract {
             panic!("unauthorized: only driver or admin can release");
         }
 
-        // Transfer funds to driver
+        let payout_contract: Address = env.storage().instance().get(&PAYOUT_CONTRACT).expect("not initialized");
+
+        // Transfer funds to driver payout contract
         let token_client = token::Client::new(&env, &escrow.token);
         token_client.transfer(
             &env.current_contract_address(),
-            &escrow.driver,
+            &payout_contract,
             &escrow.amount,
+        );
+
+        // Record payout for the driver
+        let payout_client = DriverPayoutClient::new(&env, &payout_contract);
+        payout_client.record_payout(
+            &env.current_contract_address(),
+            &escrow.driver,
+            &escrow.token,
+            &escrow.amount,
+            &ride_id,
         );
 
         escrow.status = RideStatus::Completed;
@@ -204,4 +239,118 @@ impl RideEscrowContract {
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&ADMIN).expect("not initialized")
     }
+
+    /// Returns the payout contract address.
+    pub fn get_payout_contract(env: Env) -> Address {
+        env.storage().instance().get(&PAYOUT_CONTRACT).expect("not initialized")
+    }
+
+    /// Returns the dispute contract address.
+    pub fn get_dispute_contract(env: Env) -> Address {
+        env.storage().instance().get(&DISPUTE_CONTRACT).expect("not initialized")
+    }
+
+    /// Resolves a dispute on an escrow by splitting the funds.
+    /// Only callable by the dispute resolution contract.
+    pub fn resolve_dispute(
+        env: Env,
+        caller: Address,
+        ride_id: Symbol,
+        passenger_amount: i128,
+        driver_amount: i128,
+    ) {
+        caller.require_auth();
+
+        let dispute_contract: Address = env.storage().instance().get(&DISPUTE_CONTRACT).expect("not initialized");
+        if caller != dispute_contract {
+            panic!("unauthorized: only dispute resolution contract can resolve");
+        }
+
+        let mut escrow: RideEscrow = env
+            .storage()
+            .persistent()
+            .get(&ride_id)
+            .expect("ride not found");
+
+        if escrow.status != RideStatus::Disputed {
+            panic!("escrow is not in disputed state");
+        }
+
+        if passenger_amount + driver_amount != escrow.amount {
+            panic!("passenger_amount + driver_amount must equal escrowed_amount");
+        }
+
+        let token_client = token::Client::new(&env, &escrow.token);
+
+        // 1. Pay passenger their share directly
+        if passenger_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &escrow.passenger,
+                &passenger_amount,
+            );
+        }
+
+        // 2. Pay driver their share through the payout contract
+        if driver_amount > 0 {
+            let payout_contract: Address = env.storage().instance().get(&PAYOUT_CONTRACT).expect("not initialized");
+            
+            // Transfer to payout contract
+            token_client.transfer(
+                &env.current_contract_address(),
+                &payout_contract,
+                &driver_amount,
+            );
+
+            // Record driver's payout
+            let payout_client = DriverPayoutClient::new(&env, &payout_contract);
+            payout_client.record_payout(
+                &env.current_contract_address(),
+                &escrow.driver,
+                &escrow.token,
+                &driver_amount,
+                &ride_id,
+            );
+        }
+
+        escrow.status = RideStatus::Completed;
+        env.storage().persistent().set(&ride_id, &escrow);
+
+        env.events().publish(
+            (symbol_short!("resolved"), ride_id),
+            (passenger_amount, driver_amount),
+        );
+    }
+
+    /// Dismisses a dispute, reverting the escrow status back to Funded.
+    /// Only callable by the dispute resolution contract.
+    pub fn dismiss_dispute(env: Env, caller: Address, ride_id: Symbol) {
+        caller.require_auth();
+
+        let dispute_contract: Address = env.storage().instance().get(&DISPUTE_CONTRACT).expect("not initialized");
+        if caller != dispute_contract {
+            panic!("unauthorized: only dispute resolution contract can dismiss");
+        }
+
+        let mut escrow: RideEscrow = env
+            .storage()
+            .persistent()
+            .get(&ride_id)
+            .expect("ride not found");
+
+        if escrow.status != RideStatus::Disputed {
+            panic!("escrow is not in disputed state");
+        }
+
+        escrow.status = RideStatus::Funded;
+        env.storage().persistent().set(&ride_id, &escrow);
+
+        env.events().publish(
+            (symbol_short!("dismissed"), ride_id),
+            (),
+        );
+    }
 }
+
+#[cfg(test)]
+mod test;
